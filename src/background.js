@@ -18,14 +18,14 @@ function safeUrl(value, httpsOnly = false) {
 }
 const MAX_RESPONSE_BYTES = 2_000_000;
 async function safeFetch(value, options = {}, limit = 3) {
-  let url = safeUrl(value);
+  let url = safeUrl(value, true);
   for (let n = 0; n <= limit; n++) {
     const response = await fetch(url.href, {...options, credentials:'omit', redirect:'manual'});
     if (response.type === 'opaqueredirect') throw new Error('Redirect could not be safely inspected');
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) throw new Error('Redirect without location');
-      url = safeUrl(new URL(location, url).href);
+      url = safeUrl(new URL(location, url).href, true);
       continue;
     }
     return response;
@@ -79,22 +79,21 @@ async function analyze(tabId) {
   return {data:result[0]?.result ?? null};
 }
 async function providerLookup(hostname, url) {
-  const cfg = await chrome.storage.local.get(['providerUrl','providerToken']);
+  const cfg = await chrome.storage.session.get(['providerUrl','providerToken']);
   if (!cfg.providerUrl) return {ok:false,error:'No provider configured'};
   try {
     const endpoint = safeUrl(cfg.providerUrl, true);
+    if (endpoint.search || endpoint.hash) throw new Error('Provider URL cannot contain query parameters or a fragment');
     const resolutions = await Promise.all(['A','AAAA'].map(type => responseData(`${DNS_BASE}?name=${encodeURIComponent(endpoint.hostname)}&type=${type}`, 'json', {headers:{Accept:'application/dns-json'}})));
     const addresses = resolutions.flatMap(r => r.data?.Answer || []).filter(a => a.type===1 || a.type===28).map(a=>a.data);
     if (!addresses.length || !addresses.every(publicAddress)) throw new Error('Provider does not resolve exclusively to public IP addresses');
-    endpoint.searchParams.set('domain', hostname);
-    endpoint.searchParams.set('url', url);
-    const headers = {'Accept':'application/json'};
+    const headers = {'Accept':'application/json', 'Content-Type':'application/json'};
     if (cfg.providerToken) headers.Authorization = `Bearer ${cfg.providerToken}`;
     // Do not follow redirects: prevents transmitting the token to another origin.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
-      const r = await fetch(endpoint.href, {headers, credentials:'omit', redirect:'error', signal:controller.signal});
+      const r = await fetch(endpoint.href, {method:'POST', body:JSON.stringify({domain:hostname,url}), headers, credentials:'omit', redirect:'error', signal:controller.signal});
       if (!r.ok) return {ok:false,status:r.status,error:`Provider HTTP ${r.status}`};
       const raw = await readLimited(r);
       const data = JSON.parse(raw);
@@ -127,7 +126,7 @@ async function rdapLookup(hostname) {
 }
 async function network(tabId, url) {
   const {actual} = await currentTab(tabId, url);
-  const origin = actual.origin, hostname = actual.hostname;
+  const origin = 'https://' + actual.host, hostname = actual.hostname;
   // DNS and RDAP receive only the host; third-party provider receives host + URL only upon explicit request.
   const types = ['A','AAAA','CNAME','MX','NS','TXT'];
   const dnsRecords = await Promise.all(types.map(type => responseData(`${DNS_BASE}?name=${encodeURIComponent(hostname)}&type=${type}`, 'json', {headers:{Accept:'application/dns-json'}})));
@@ -173,7 +172,7 @@ async function dataforseo(tabId,url,report,locationCode,languageCode,publisherId
   const costs=[];
   try {
     const {actual}=await currentTab(tabId,url);
-    const cfg=await chrome.storage.local.get(['dfsLogin','dfsPassword','dfsSandbox']);
+    const cfg={...await chrome.storage.local.get(['dfsSandbox']), ...await chrome.storage.session.get(['dfsLogin','dfsPassword'])};
     if (!cfg.dfsLogin || !cfg.dfsPassword) return {ok:false,error:'请先在设置中填写 DataForSEO API 登录名和密码',costs};
     if (!['traffic','backlinks','keywords','adsense'].includes(report)) return {ok:false,error:'不支持此报告',costs};
     // Domain scope is explicit, and never transmit page path, query or fragment.
@@ -210,28 +209,9 @@ async function dataforseo(tabId,url,report,locationCode,languageCode,publisherId
     return {ok:true,report,source,costs,data:{target,summary:summary.result,items:links.ok?(links.result?.items??[]):null},warning:links.ok?null:links.error};
   }catch(e){return {ok:false,error:e?.message||String(e),costs};}
 }
-// Similarweb's official all-device visits endpoint uses an API key in its query string.
-// Never return the request URL, response body, key, or transport error text to the caller.
-async function similarweb(tabId,url,month,country) {
-  try {
-    const {actual}=await currentTab(tabId,url);
-    const cfg=await chrome.storage.local.get(['similarwebKey']);
-    if(!cfg.similarwebKey) return {ok:false,error:'请先在设置中填写 Similarweb API Key'};
-    if(typeof month!=='string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) return {ok:false,error:'月份格式须为 YYYY-MM'};
-    if(typeof country!=='string' || !/^(world|[a-z]{2})$/i.test(country)) return {ok:false,error:'国家须为 world 或两字母代码'};
-    const target=actual.hostname.replace(/^www\./i,'');
-    const endpoint=new URL(`https://api.similarweb.com/v1/website/${encodeURIComponent(target)}/total-traffic-and-engagement/visits`);
-    endpoint.search=new URLSearchParams({api_key:cfg.similarwebKey,start_date:month,end_date:month,country:country.toLowerCase(),granularity:'monthly',main_domain_only:'false',format:'json'}).toString();
-    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),TIMEOUT_MS);
-    try {
-      const r=await fetch(endpoint.href,{credentials:'omit',redirect:'error',signal:controller.signal,headers:{Accept:'application/json'}});
-      if(!r.ok)return {ok:false,error:`Similarweb HTTP ${r.status}；可能已产生费用`};
-      const obj=JSON.parse(await readLimited(r));
-      const visits=Array.isArray(obj.visits)?obj.visits.map(x=>({date:typeof x.date==='string' && /^\d{4}-\d{2}(?:-\d{2})?$/.test(x.date)?x.date:null,visits:typeof x.visits==='number' && Number.isFinite(x.visits)?x.visits:null})):null;
-      return {ok:true,source:'Similarweb',data:{target,month,country:country.toLowerCase(),visits}};
-    } catch (_) { return {ok:false,error:'Similarweb 请求失败、超时或返回无效数据；可能已产生费用'}; }
-    finally {clearTimeout(timer)}
-  } catch (_) {return {ok:false,error:'当前页面已变化或无法查询'};}
+// Direct Similarweb integration is disabled: the vendor API requires a secret in the URL.
+async function similarweb() {
+  return {ok:false,error:'Similarweb 直接 API 暂不可用：密钥会出现在请求网址中。可使用 Similarweb 网站或安全的兼容数据服务。'};
 }
 function trustedSender(sender) {
   return sender.id === chrome.runtime.id && typeof sender.url === 'string' && sender.url.startsWith(chrome.runtime.getURL(''));
@@ -255,6 +235,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
+  // Remove legacy persistent secrets on installation or upgrade; users must re-enter them.
+  chrome.storage.local.remove(['dfsLogin','dfsPassword','providerUrl','providerToken','similarwebKey']).catch(() => {});
   chrome.sidePanel.setPanelBehavior({openPanelOnActionClick:true}).catch(() => {});
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({id:'scout-parent', title:'ScoutLens SEO', contexts:['page','selection','link']});
@@ -271,6 +253,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'scout-search' && info.selectionText) { chrome.tabs.create({url:'https://www.google.com/search?q='+encodeURIComponent(info.selectionText)}); return; }
   try {
     const u = safeUrl(target);
+    u.search = ''; u.hash = '';
     if (info.menuItemId === 'scout-archive') chrome.tabs.create({url:'https://web.archive.org/web/*/'+u.href});
     if (info.menuItemId === 'scout-pagespeed') chrome.tabs.create({url:'https://pagespeed.web.dev/analysis?url='+encodeURIComponent(u.href)});
   } catch (_) {}
@@ -280,6 +263,7 @@ chrome.commands.onCommand.addListener(async command => {
   if (!tab?.url || !tab.windowId) return;
   try {
     const u = safeUrl(tab.url);
+    u.search = ''; u.hash = '';
     if (command === 'open-panel') await chrome.sidePanel.open({windowId:tab.windowId});
     else if (command === 'similarweb') await chrome.tabs.create({url:'https://www.similarweb.com/website/'+encodeURIComponent(u.hostname)});
     else if (command === 'semrush') await chrome.tabs.create({url:'https://www.semrush.com/analytics/overview/?searchType=domain&q='+encodeURIComponent(u.href)});
