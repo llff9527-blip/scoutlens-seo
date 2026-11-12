@@ -150,7 +150,8 @@ const DFS_PATHS = {
   traffic:'/v3/dataforseo_labs/google/bulk_traffic_estimation/live',
   keywords:'/v3/dataforseo_labs/google/ranked_keywords/live',
   summary:'/v3/backlinks/summary/live',
-  links:'/v3/backlinks/backlinks/live'
+  links:'/v3/backlinks/backlinks/live',
+  adsense:'/v3/domain_analytics/technologies/domains_by_html_terms/live'
 };
 async function dataforseoRequest(path, payload, cfg) {
   const host = cfg.dfsSandbox ? 'sandbox.dataforseo.com' : 'api.dataforseo.com';
@@ -168,17 +169,24 @@ async function dataforseoRequest(path, payload, cfg) {
   } catch (e) { return {ok:false,error:`DataForSEO request failed: ${e?.message || String(e)}`,cost:null}; }
   finally { clearTimeout(timer); }
 }
-async function dataforseo(tabId,url,report,locationCode,languageCode) {
+async function dataforseo(tabId,url,report,locationCode,languageCode,publisherId) {
   const costs=[];
   try {
     const {actual}=await currentTab(tabId,url);
     const cfg=await chrome.storage.local.get(['dfsLogin','dfsPassword','dfsSandbox']);
     if (!cfg.dfsLogin || !cfg.dfsPassword) return {ok:false,error:'请先在设置中填写 DataForSEO API 登录名和密码',costs};
-    if (!['traffic','backlinks','keywords'].includes(report)) return {ok:false,error:'不支持此报告',costs};
+    if (!['traffic','backlinks','keywords','adsense'].includes(report)) return {ok:false,error:'不支持此报告',costs};
     // Domain scope is explicit, and never transmit page path, query or fragment.
     const target=actual.hostname.replace(/^www\./i,'');
     const call=async (name,payload)=>{const r=await dataforseoRequest(DFS_PATHS[name],payload,cfg);costs.push({endpoint:DFS_PATHS[name],cost:r.cost});return r;};
     const source=cfg.dfsSandbox?'DataForSEO Sandbox (dummy data)':'DataForSEO';
+    if(report==='adsense') {
+      if(typeof publisherId !== 'string' || !/^pub-\d{16}$/.test(publisherId)) return {ok:false,error:'发布商 ID 必须为 pub- 加 16 位数字',costs};
+      const r=await call('adsense',{search_terms:[publisherId],mode:'strict_entry',limit:20});
+      if(!r.ok)return {ok:false,error:r.error,costs};
+      const items=Array.isArray(r.result?.items) ? r.result.items.map(x=>({domain:x.domain??null,title:x.title??null,description:x.description??null,last_visited:x.last_visited??null})) : [];
+      return {ok:true,report,source,costs,data:{publisherId,totalCount:r.result?.total_count??null,items,warning:'第三方索引匹配的是首页 HTML，不覆盖 ads.txt 或所有页面；候选结果需要人工验证，不证明网站所有权。'}};
+    }
     if(report==='keywords') {
       const payload={target,limit:20,item_types:['organic']};
       if(locationCode !== undefined && locationCode !== null && locationCode !== '') {const n=Number(locationCode);if(!Number.isInteger(n)||n<1)throw Error('Invalid location code');payload.location_code=n;}
@@ -202,6 +210,29 @@ async function dataforseo(tabId,url,report,locationCode,languageCode) {
     return {ok:true,report,source,costs,data:{target,summary:summary.result,items:links.ok?(links.result?.items??[]):null},warning:links.ok?null:links.error};
   }catch(e){return {ok:false,error:e?.message||String(e),costs};}
 }
+// Similarweb's official all-device visits endpoint uses an API key in its query string.
+// Never return the request URL, response body, key, or transport error text to the caller.
+async function similarweb(tabId,url,month,country) {
+  try {
+    const {actual}=await currentTab(tabId,url);
+    const cfg=await chrome.storage.local.get(['similarwebKey']);
+    if(!cfg.similarwebKey) return {ok:false,error:'请先在设置中填写 Similarweb API Key'};
+    if(typeof month!=='string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) return {ok:false,error:'月份格式须为 YYYY-MM'};
+    if(typeof country!=='string' || !/^(world|[a-z]{2})$/i.test(country)) return {ok:false,error:'国家须为 world 或两字母代码'};
+    const target=actual.hostname.replace(/^www\./i,'');
+    const endpoint=new URL(`https://api.similarweb.com/v1/website/${encodeURIComponent(target)}/total-traffic-and-engagement/visits`);
+    endpoint.search=new URLSearchParams({api_key:cfg.similarwebKey,start_date:month,end_date:month,country:country.toLowerCase(),granularity:'monthly',main_domain_only:'false',format:'json'}).toString();
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),TIMEOUT_MS);
+    try {
+      const r=await fetch(endpoint.href,{credentials:'omit',redirect:'error',signal:controller.signal,headers:{Accept:'application/json'}});
+      if(!r.ok)return {ok:false,error:`Similarweb HTTP ${r.status}；可能已产生费用`};
+      const obj=JSON.parse(await readLimited(r));
+      const visits=Array.isArray(obj.visits)?obj.visits.map(x=>({date:typeof x.date==='string' && /^\d{4}-\d{2}(?:-\d{2})?$/.test(x.date)?x.date:null,visits:typeof x.visits==='number' && Number.isFinite(x.visits)?x.visits:null})):null;
+      return {ok:true,source:'Similarweb',data:{target,month,country:country.toLowerCase(),visits}};
+    } catch (_) { return {ok:false,error:'Similarweb 请求失败、超时或返回无效数据；可能已产生费用'}; }
+    finally {clearTimeout(timer)}
+  } catch (_) {return {ok:false,error:'当前页面已变化或无法查询'};}
+}
 function trustedSender(sender) {
   return sender.id === chrome.runtime.id && typeof sender.url === 'string' && sender.url.startsWith(chrome.runtime.getURL(''));
 }
@@ -211,7 +242,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       if (message?.type === 'ANALYZE') return await analyze(message.tabId);
       if (message?.type === 'NETWORK') return await network(message.tabId, message.url);
-      if (message?.type === 'DATAFORSEO') return await dataforseo(message.tabId,message.url,message.report,message.locationCode,message.languageCode);
+      if (message?.type === 'DATAFORSEO') return await dataforseo(message.tabId,message.url,message.report,message.locationCode,message.languageCode,message.publisherId);
+      if (message?.type === 'SIMILARWEB') return await similarweb(message.tabId,message.url,message.month,message.country);
       if (message?.type === 'PROVIDER') {
         const {actual} = await currentTab(message.tabId, message.url);
         return {provider:await providerLookup(actual.hostname, actual.origin + actual.pathname)};
