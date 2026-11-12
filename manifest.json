@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "ScoutLens SEO",
+  "version": "0.1.0",
+  "description": "On-page SEO and GEO inspection with transparent external data sources.",
+  "minimum_chrome_version": "116",
+  "permissions": ["activeTab", "scripting", "tabs", "storage", "sidePanel", "contextMenus"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {"service_worker": "src/background.js"},
+  "side_panel": {"default_path": "src/panel.html"},
+  "action": {"default_title": "Open ScoutLens SEO"},
+  "commands": {
+    "open-panel": {"suggested_key": {"default": "Alt+D", "mac": "Alt+D"}, "description": "Open ScoutLens SEO"},
+    "similarweb": {"suggested_key": {"default": "Alt+S", "mac": "Alt+S"}, "description": "Open Similarweb for this host"},
+    "semrush": {"suggested_key": {"default": "Alt+R", "mac": "Alt+R"}, "description": "Open Semrush for this URL"}
+  },
+  "web_accessible_resources": [{"resources": ["src/audit.js"], "matches": ["http://*/*", "https://*/*"]}]
+}
