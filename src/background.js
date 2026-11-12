@@ -135,14 +135,72 @@ async function network(tabId, url) {
   const addresses = [...(dns.A.data?.Answer || []), ...(dns.AAAA.data?.Answer || [])].filter(a => a.type === 1 || a.type === 28).map(a => a.data);
   const publicResolution = addresses.length > 0 && addresses.every(publicAddress);
   const unavailable = {ok:false,error:'Site requests skipped: public DNS did not resolve exclusively to public addresses'};
-  const [robots,sitemap,llms,rdap] = await Promise.all([
+  const [robots,sitemap,llms,adsTxt,rdap] = await Promise.all([
     publicResolution ? responseData(origin + '/robots.txt') : unavailable,
     publicResolution ? responseData(origin + '/sitemap.xml') : unavailable,
     publicResolution ? responseData(origin + '/llms.txt') : unavailable,
+    publicResolution ? responseData(origin + '/ads.txt') : unavailable,
     rdapLookup(hostname)
   ]);
-  const data = {hostname, robots, sitemap, llms, rdap, dns};
+  const data = {hostname, robots, sitemap, llms, adsTxt, rdap, dns};
   return data;
+}
+// Fixed DataForSEO origin and path allowlist; no caller-controlled endpoint or URL parameters.
+const DFS_PATHS = {
+  traffic:'/v3/dataforseo_labs/google/bulk_traffic_estimation/live',
+  keywords:'/v3/dataforseo_labs/google/ranked_keywords/live',
+  summary:'/v3/backlinks/summary/live',
+  links:'/v3/backlinks/backlinks/live'
+};
+async function dataforseoRequest(path, payload, cfg) {
+  const host = cfg.dfsSandbox ? 'sandbox.dataforseo.com' : 'api.dataforseo.com';
+  const creds = new TextEncoder().encode(`${cfg.dfsLogin}:${cfg.dfsPassword}`);
+  const basic = btoa(Array.from(creds, b => String.fromCharCode(b)).join(''));
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://${host}${path}`, {method:'POST', credentials:'omit', redirect:'error', signal:controller.signal,
+      headers:{'Authorization':`Basic ${basic}`, 'Content-Type':'application/json', 'Accept':'application/json'}, body:JSON.stringify([payload])});
+    if (!response.ok) return {ok:false,error:`DataForSEO HTTP ${response.status}`,cost:null};
+    const obj = JSON.parse(await readLimited(response));
+    const task = obj.tasks?.[0], cost = typeof obj.cost === 'number' ? obj.cost : (typeof task?.cost === 'number' ? task.cost : null);
+    if (obj.status_code !== 20000 || !task || task.status_code !== 20000) return {ok:false,error:`DataForSEO error ${task?.status_code ?? obj.status_code ?? 'unknown'}: ${task?.status_message ?? obj.status_message ?? 'No task'}`,cost};
+    return {ok:true, result:task.result?.[0] ?? null, cost};
+  } catch (e) { return {ok:false,error:`DataForSEO request failed: ${e?.message || String(e)}`,cost:null}; }
+  finally { clearTimeout(timer); }
+}
+async function dataforseo(tabId,url,report,locationCode,languageCode) {
+  const costs=[];
+  try {
+    const {actual}=await currentTab(tabId,url);
+    const cfg=await chrome.storage.local.get(['dfsLogin','dfsPassword','dfsSandbox']);
+    if (!cfg.dfsLogin || !cfg.dfsPassword) return {ok:false,error:'请先在设置中填写 DataForSEO API 登录名和密码',costs};
+    if (!['traffic','backlinks','keywords'].includes(report)) return {ok:false,error:'不支持此报告',costs};
+    // Domain scope is explicit, and never transmit page path, query or fragment.
+    const target=actual.hostname.replace(/^www\./i,'');
+    const call=async (name,payload)=>{const r=await dataforseoRequest(DFS_PATHS[name],payload,cfg);costs.push({endpoint:DFS_PATHS[name],cost:r.cost});return r;};
+    const source=cfg.dfsSandbox?'DataForSEO Sandbox (dummy data)':'DataForSEO';
+    if(report==='keywords') {
+      const payload={target,limit:20,item_types:['organic']};
+      if(locationCode !== undefined && locationCode !== null && locationCode !== '') {const n=Number(locationCode);if(!Number.isInteger(n)||n<1)throw Error('Invalid location code');payload.location_code=n;}
+      if(languageCode) {if(!/^[a-z]{2,3}$/i.test(languageCode))throw Error('Invalid language code');payload.language_code=languageCode.toLowerCase();}
+      const r=await call('keywords',payload);if(!r.ok)return {ok:false,error:r.error,costs};
+      return {ok:true,report,source,costs,data:r.result?{target,locationCode:r.result.location_code??null,languageCode:r.result.language_code??null,totalCount:r.result.total_count??null,items:r.result.items??[]}:null};
+    }
+    if(report==='traffic') {
+      const payload={targets:[target],item_types:['organic','paid']};
+      if(locationCode !== undefined && locationCode !== null && locationCode !== '') { const n=Number(locationCode); if(!Number.isInteger(n)||n<1) throw Error('Invalid location code'); payload.location_code=n; }
+      if(languageCode) { if(!/^[a-z]{2,3}$/i.test(languageCode))throw Error('Invalid language code');payload.language_code=languageCode.toLowerCase(); }
+      const r=await call('traffic',payload); if(!r.ok)return {ok:false,error:r.error,costs};
+      const item=r.result?.items?.find(x=>x.target?.toLowerCase()===target.toLowerCase()) ?? (cfg.dfsSandbox ? r.result?.items?.[0] : null) ?? null;
+      if (!item) return {ok:true,report,source,costs,data:null,notice:'无匹配数据，不代表流量为零。'};
+      return {ok:true,report,source,costs,data:{target,locationCode:r.result?.location_code??payload.location_code??null,languageCode:r.result?.language_code??payload.language_code??null,organic:item.metrics?.organic??null,paid:item.metrics?.paid??null}};
+    }
+    const p={target,include_subdomains:true,backlinks_status_type:'live'};
+    const summary=await call('summary',{...p,rank_scale:'one_hundred'});if(!summary.ok)return {ok:false,error:summary.error,costs};
+    const links=await call('links',{...p,rank_scale:'one_hundred',limit:20,mode:'one_per_domain'});
+    // Preserve the paid summary even if list lookup fails.
+    return {ok:true,report,source,costs,data:{target,summary:summary.result,items:links.ok?(links.result?.items??[]):null},warning:links.ok?null:links.error};
+  }catch(e){return {ok:false,error:e?.message||String(e),costs};}
 }
 function trustedSender(sender) {
   return sender.id === chrome.runtime.id && typeof sender.url === 'string' && sender.url.startsWith(chrome.runtime.getURL(''));
@@ -153,6 +211,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       if (message?.type === 'ANALYZE') return await analyze(message.tabId);
       if (message?.type === 'NETWORK') return await network(message.tabId, message.url);
+      if (message?.type === 'DATAFORSEO') return await dataforseo(message.tabId,message.url,message.report,message.locationCode,message.languageCode);
       if (message?.type === 'PROVIDER') {
         const {actual} = await currentTab(message.tabId, message.url);
         return {provider:await providerLookup(actual.hostname, actual.origin + actual.pathname)};
